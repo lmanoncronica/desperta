@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import wave
 import json
 import time
 import threading
@@ -15,6 +17,14 @@ try:
     STT_DISPONIBLE = True
 except Exception:
     STT_DISPONIBLE = False
+
+# Captura de audio continua (escucha siempre activa). Opcional.
+try:
+    import av  # noqa: F401
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    WEBRTC_DISPONIBLE = True
+except Exception:
+    WEBRTC_DISPONIBLE = False
 
 # ============================================================
 #  BCN DESPERTA PRO  ·  Fact-checking editorial en directo
@@ -46,6 +56,7 @@ ELEVEN_API_KEY     = get_secret("ELEVENLABS_API_KEY")
 API_KEY_PERPLEXITY = get_secret("PERPLEXITY_API_KEY")
 VOICE_ID           = get_secret("ELEVENLABS_VOICE_ID", "z0BZOmPMDRocOWMwLB5J")
 SUPABASE_DB_URL    = get_secret("SUPABASE_DB_URL")   # opcional: persistencia entre reinicios
+DEEPGRAM_API_KEY   = get_secret("DEEPGRAM_API_KEY")  # opcional: escucha continua siempre activa
 
 # Modelo de voz para directo. Flash v2.5 ≈ <75ms (ideal en vivo);
 # Multilingual v2 = más calidad pero más lento.
@@ -62,20 +73,30 @@ PERPLEXITY_MODEL = "sonar-pro"
 # Puedes cambiar estos valores aquí (quedan fijos) o en vivo desde el panel
 # "🎨 Apariencia" de la barra lateral (se aplican al instante en la pantalla).
 BRANDING_DEFAULT = {
-    "titulo": "BCN DESPERTA",
-    "color_fondo": "#000000",
-    "color_texto": "#FFFFFF",
-    "color_acento": "#FF0000",
-    "logo_url": "",          # pega aquí la URL de una imagen para mostrar el logo
-    "tam_titular": 80,       # tamaño del titular en la pantalla (px)
+    "titulo": "BCN DESPERTA",          # nombre del programa (cabecera del control)
+    "fuente": "Arial",                 # tipografía de la pantalla
+    "color_fondo": "#000000",          # fondo de la pantalla
+    "color_titular": "#FFFFFF",        # color del titular
+    "color_verificacion": "#FF0000",   # color de la verificación
+    "color_acento": "#FF0000",         # color del borde lateral
+    "grosor_borde": 25,                # grosor del borde lateral (0 = sin borde)
+    "tam_titular": 80,                 # tamaño del titular (px)
+    "tam_verificacion": 38,            # tamaño de la verificación (px)
+    "mayusculas": True,                # titular en MAYÚSCULAS
+    "alineacion": "left",              # "left" o "center"
+    "logo_url": "",                    # URL de imagen para el logo
+    "tam_logo": 130,                   # alto del logo (px)
 }
+
+FUENTES = ["Arial", "Oswald", "Montserrat", "Georgia", "Verdana", "Tahoma",
+           "Trebuchet MS", "Impact", "Times New Roman", "Courier New"]
 
 
 # --- 2. MEMORIA CENTRAL ---
 @st.cache_resource
 class SharedState:
     def __init__(self):
-        self.en_pantalla = {"t": "BCN DESPERTA", "v": "SISTEMA LISTO"}
+        self.en_pantalla = {"t": "", "v": ""}   # arranca en blanco
         self.cola_pendientes = []
         self.cola_resultados = []
         self.archivo_historico = []
@@ -256,6 +277,34 @@ def extraer_sugerencias(transcript):
     except Exception:
         pass
     return []
+
+
+# --- ESCUCHA CONTINUA: audio PCM -> WAV -> transcripción con Deepgram ---
+def _pcm_a_wav(pcm, rate=16000):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)      # 16 bits
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def transcribir_deepgram(wav_bytes):
+    if not DEEPGRAM_API_KEY:
+        return ""
+    try:
+        r = requests.post(
+            "https://api.deepgram.com/v1/listen?language=es&model=nova-2&smart_format=true",
+            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}",
+                     "Content-Type": "audio/wav"},
+            data=wav_bytes, timeout=20)
+        if r.status_code == 200:
+            alt = r.json()["results"]["channels"][0]["alternatives"][0]
+            return (alt.get("transcript") or "").strip()
+    except Exception:
+        pass
+    return ""
 
 
 # --- 4c. MOTOR CLAUDE (con búsqueda web real) ---
@@ -474,7 +523,7 @@ if not gs.cargado:
 
 st.set_page_config(page_title=gs.branding["titulo"], layout="wide")
 
-modo = st.sidebar.radio("MODO:", ["🛠️ CONTROL", "📺 ESCENARIO"])
+modo = st.sidebar.radio("MODO:", ["🛠️ CONTROL", "👂 ESCUCHA", "📺 ESCENARIO"])
 
 # Aviso si faltan claves
 if not API_KEY_GEMINI:
@@ -495,12 +544,25 @@ mostrar_pplx = st.sidebar.checkbox("Mostrar Perplexity (opcional)", value=False)
 if modo == "🛠️ CONTROL":
     with st.sidebar.expander("🎨 Apariencia (pantalla)"):
         b = gs.branding
-        b["titulo"]       = st.text_input("Título / nombre", b["titulo"])
-        b["color_fondo"]  = st.color_picker("Fondo", b["color_fondo"])
-        b["color_texto"]  = st.color_picker("Texto", b["color_texto"])
-        b["color_acento"] = st.color_picker("Acento (borde y verificación)", b["color_acento"])
-        b["tam_titular"]  = st.slider("Tamaño del titular", 40, 130, b["tam_titular"])
-        b["logo_url"]     = st.text_input("Logo (URL de imagen)", b["logo_url"])
+        b["titulo"] = st.text_input("Nombre del programa", b["titulo"])
+        _idx = FUENTES.index(b["fuente"]) if b["fuente"] in FUENTES else 0
+        b["fuente"] = st.selectbox("Tipografía", FUENTES, index=_idx)
+        c1, c2 = st.columns(2)
+        b["color_fondo"]        = c1.color_picker("Fondo", b["color_fondo"])
+        b["color_titular"]      = c2.color_picker("Titular", b["color_titular"])
+        b["color_verificacion"] = c1.color_picker("Verificación", b["color_verificacion"])
+        b["color_acento"]       = c2.color_picker("Borde", b["color_acento"])
+        b["grosor_borde"]     = st.slider("Grosor del borde", 0, 60, b["grosor_borde"])
+        b["tam_titular"]      = st.slider("Tamaño titular", 30, 140, b["tam_titular"])
+        b["tam_verificacion"] = st.slider("Tamaño verificación", 18, 80, b["tam_verificacion"])
+        b["mayusculas"] = st.checkbox("Titular en MAYÚSCULAS", b["mayusculas"])
+        b["alineacion"] = st.radio(
+            "Alineación", ["left", "center"],
+            index=0 if b["alineacion"] == "left" else 1,
+            format_func=lambda x: "Izquierda" if x == "left" else "Centro",
+            horizontal=True)
+        b["logo_url"]  = st.text_input("Logo (URL de imagen)", b["logo_url"])
+        b["tam_logo"]  = st.slider("Tamaño del logo", 40, 320, b["tam_logo"])
         if st.button("↩️ Restaurar diseño original"):
             gs.branding = dict(BRANDING_DEFAULT)
             st.rerun()
@@ -535,27 +597,40 @@ if modo == "🛠️ CONTROL":
 
 st.sidebar.caption(f"Modelo IA: {WORKING_MODEL.split('/')[-1]}")
 
-# CSS construido a partir de la apariencia elegida
+# CSS: el panel de control queda oscuro y legible; la PANTALLA usa toda la apariencia
 b = gs.branding
+_align_items = "center" if b["alineacion"] == "center" else "flex-start"
 _css = """
     <style>
-    .main { background-color: __FONDO__ !important; color: __TEXTO__ !important; }
-    .stApp { background-color: __FONDO__; }
-    .box-escena { background: __FONDO__; padding: 60px; border-left: 25px solid __ACENTO__;
-                  height: 100vh; display: flex; flex-direction: column; justify-content: center; }
-    .tit-live { font-size: __TAMTIT__px; font-weight: bold; text-transform: uppercase;
-                line-height: 1.1; margin-bottom: 20px; color: __TEXTO__; }
-    .ver-live { font-size: 38px; color: __ACENTO__; font-style: italic;
-                border-top: 2px solid #333; padding-top: 20px; white-space: pre-wrap; }
+    @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;700&family=Montserrat:wght@600;800&display=swap');
+    .main { background-color: #000 !important; color: #FFF !important; }
+    .stApp { background-color: #000; }
+    .box-escena { background: __FONDO__; padding: 60px; border-left: __BORDE__px solid __ACENTO__;
+                  height: 100vh; display: flex; flex-direction: column; justify-content: center;
+                  align-items: __ALIGNITEMS__; text-align: __ALIGN__; }
+    .tit-live { font-family: __FUENTE__; font-size: __TAMTIT__px; font-weight: 700;
+                text-transform: __TRANSFORM__; line-height: 1.1; margin-bottom: 20px;
+                color: __TITULAR__; }
+    .ver-live { font-family: __FUENTE__; font-size: __TAMVER__px; color: __VERIF__;
+                font-style: italic; border-top: 2px solid #333; padding-top: 20px;
+                white-space: pre-wrap; }
     .card-mem { background: #111; padding: 12px; border: 1px solid #333;
                 margin-bottom: 10px; border-radius: 5px; }
-    .logo-escena { max-height: 130px; margin-bottom: 35px; }
+    .logo-escena { max-height: __TAMLOGO__px; margin-bottom: 35px; }
     </style>
 """
 _css = (_css.replace("__FONDO__", b["color_fondo"])
-            .replace("__TEXTO__", b["color_texto"])
             .replace("__ACENTO__", b["color_acento"])
-            .replace("__TAMTIT__", str(b["tam_titular"])))
+            .replace("__BORDE__", str(b["grosor_borde"]))
+            .replace("__ALIGNITEMS__", _align_items)
+            .replace("__ALIGN__", b["alineacion"])
+            .replace("__FUENTE__", f"'{b['fuente']}', Arial, sans-serif")
+            .replace("__TAMTIT__", str(b["tam_titular"]))
+            .replace("__TRANSFORM__", "uppercase" if b["mayusculas"] else "none")
+            .replace("__TITULAR__", b["color_titular"])
+            .replace("__TAMVER__", str(b["tam_verificacion"]))
+            .replace("__VERIF__", b["color_verificacion"])
+            .replace("__TAMLOGO__", str(b["tam_logo"])))
 st.markdown(_css, unsafe_allow_html=True)
 
 if modo == "🛠️ CONTROL":
@@ -715,6 +790,65 @@ if modo == "🛠️ CONTROL":
 
     # Guarda automáticamente el estado (si hay base de datos configurada)
     guardar_estado()
+
+elif modo == "👂 ESCUCHA":
+    st.title("👂 Escucha continua")
+    st.caption("Pulsa START y deja el micrófono abierto: transcribe en continuo y propone "
+               "titulares automáticamente. Las sugerencias aparecen en el modo CONTROL. "
+               "Mantén esta pestaña abierta en un equipo cerca del audio del acto.")
+
+    if not WEBRTC_DISPONIBLE:
+        st.error("Falta instalar streamlit-webrtc y av. Sube el requirements.txt nuevo "
+                 "y deja que Streamlit reinstale.")
+    elif not DEEPGRAM_API_KEY:
+        st.warning("Falta DEEPGRAM_API_KEY en los Secrets. Crea una cuenta en deepgram.com "
+                   "(tiene crédito gratis), copia la clave y pégala en los Secrets.")
+    else:
+        webrtc_ctx = webrtc_streamer(
+            key="escucha-continua",
+            mode=WebRtcMode.SENDONLY,
+            audio_receiver_size=1024,
+            media_stream_constraints={"audio": True, "video": False},
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        )
+        estado = st.empty()
+        trans_box = st.empty()
+
+        if "buf_audio" not in st.session_state:
+            st.session_state.buf_audio = b""
+            st.session_state.t_ultimo = time.time()
+            st.session_state.trans_acum = ""
+
+        if webrtc_ctx.state.playing:
+            estado.success("🔴 Escuchando… (deja esta pestaña abierta)")
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+            while True:
+                try:
+                    frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
+                except Exception:
+                    break
+                for f in frames:
+                    for rf in resampler.resample(f):
+                        st.session_state.buf_audio += bytes(rf.planes[0])
+                # cada ~5 s, transcribe el bloque acumulado y propone titulares
+                if time.time() - st.session_state.t_ultimo > 5 and st.session_state.buf_audio:
+                    wav = _pcm_a_wav(st.session_state.buf_audio, 16000)
+                    st.session_state.buf_audio = b""
+                    st.session_state.t_ultimo = time.time()
+                    txt = transcribir_deepgram(wav)
+                    if txt:
+                        st.session_state.trans_acum = (
+                            st.session_state.trans_acum + " " + txt)[-1200:]
+                        gs.transcript_log.insert(
+                            0, {"h": time.strftime("%H:%M:%S"), "txt": txt})
+                        trans_box.markdown(
+                            f"**Transcripción reciente:** {st.session_state.trans_acum[-500:]}")
+                        for k, s in enumerate(extraer_sugerencias(txt)):
+                            s["id"] = time.time() + k
+                            gs.sugerencias.insert(0, s)
+                        guardar_estado()
+        else:
+            estado.info("Pulsa START para empezar a escuchar. Las propuestas irán al modo CONTROL.")
 
 else:  # --- MODO ESCENARIO ---
     from streamlit_autorefresh import st_autorefresh
