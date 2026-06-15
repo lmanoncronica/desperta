@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import threading
@@ -110,6 +111,43 @@ def discover_model(api_key):
 WORKING_MODEL = discover_model(API_KEY_GEMINI)
 
 
+# --- JERARQUÍA DE FUENTES Y FORMATEADOR (compartido por Gemini y Claude) ---
+INSTRUCCION_FUENTES = (
+    "Verifica el dato buscando en la web. Prioriza fuentes en este orden estricto: "
+    "1) Crónica Global (cronicaglobal.elespanol.com), "
+    "2) Metrópoli Abierta (metropoliabierta.elespanol.com), "
+    "3) El Español (elespanol.com). "
+    "Solo si esos tres medios no tienen nada sobre el tema, busca en el resto de la "
+    "prensa fiable e indícalo. Sé preciso: NO afirmes nada que no aparezca en una "
+    "fuente concreta; si algo no se puede confirmar, dilo claramente. "
+    "FORMATO: Línea 1 = titular claro y conciso. Líneas siguientes = verificación breve "
+    "(qué es cierto, qué es matizable o falso). No escribas etiquetas como 'TITULAR:'."
+)
+
+
+def formatear_fuentes(pares):
+    """Construye un bloque 'Fuentes:' a partir de [(titulo, url)], sin duplicados."""
+    vistos, lineas = set(), []
+    for titulo, url in pares:
+        if not url or url in vistos:
+            continue
+        vistos.add(url)
+        lineas.append(f"- {titulo}: {url}")
+    if not lineas:
+        return "\n\n⚠️ FUENTES: no se obtuvo ninguna fuente web. Verificar a mano."
+    return "\n\nFuentes:\n" + "\n".join(lineas)
+
+
+def limpiar_para_voz(texto):
+    """Quita el bloque de fuentes y cualquier URL para que la voz no las lea."""
+    for marca in ["\nFuentes:", "\n⚠️ FUENTES", "\nFUENTES:", "Fuentes:", "⚠️ FUENTES"]:
+        idx = texto.find(marca)
+        if idx != -1:
+            texto = texto[:idx]
+    texto = re.sub(r"https?://\S+", "", texto)   # por si quedara alguna URL suelta
+    return texto.strip()
+
+
 def consultar_ia(texto, feedback=None, historial=None):
     if not API_KEY_GEMINI:
         return "⚠️ Falta GEMINI_API_KEY en secrets.toml."
@@ -117,29 +155,35 @@ def consultar_ia(texto, feedback=None, historial=None):
     url = (f"https://generativelanguage.googleapis.com/v1beta/"
            f"{WORKING_MODEL}:generateContent?key={API_KEY_GEMINI}")
 
-    prompt = (
-        f"Hoy es {fecha_hoy_es()}. BCN DESPERTA. "
-        "PRIORIDAD FUENTES: 1. Crónica Global, 2. Metrópoli Abierta, 3. El Español. "
-        "Si no está ahí, busca en toda la prensa e indica cuál. "
-        "FORMATO: Línea 1: Titular. Líneas 2-4: Verificación breve. "
-        "Línea final: Fuentes: [Medios]. "
-        "REGLA: NO escribas 'TITULAR:' ni 'VERIFICACIÓN:'.\n"
-    )
+    prompt = f"Hoy es {fecha_hoy_es()}. Eres verificador de BCN DESPERTA. {INSTRUCCION_FUENTES}\n"
 
     if feedback:
         contenido = (f"ANÁLISIS PREVIO: {historial}. "
                      f"CORRECCIÓN DEL EDITOR: {feedback}. "
-                     "Genera la nueva versión final.")
+                     "Genera la nueva versión final, volviendo a buscar si hace falta.")
     else:
         contenido = f"Verifica esto: {texto}"
 
-    payload = {"contents": [{"parts": [{"text": prompt + contenido}]}]}
+    payload = {
+        "contents": [{"parts": [{"text": prompt + contenido}]}],
+        # Búsqueda real con Google (grounding): trae fuentes web auténticas.
+        "tools": [{"google_search": {}}],
+    }
     try:
-        res = requests.post(url, json=payload, timeout=20)
-        if res.status_code == 200:
-            raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return raw.replace("TITULAR:", "").replace("VERIFICACION:", "").strip()
-        return f"Error IA {res.status_code}: {res.text[:300]}"
+        res = requests.post(url, json=payload, timeout=30)
+        if res.status_code != 200:
+            return f"Error IA {res.status_code}: {res.text[:300]}"
+        cand = res.json()["candidates"][0]
+        partes = cand.get("content", {}).get("parts", [])
+        raw = "".join(p.get("text", "") for p in partes).strip()
+        raw = raw.replace("TITULAR:", "").replace("VERIFICACION:", "").strip()
+        # Fuentes reales devueltas por el grounding
+        fuentes = []
+        for ch in cand.get("groundingMetadata", {}).get("groundingChunks", []):
+            web = ch.get("web", {})
+            titulo = web.get("title") or web.get("domain") or "Fuente"
+            fuentes.append((titulo, web.get("uri", "")))
+        return raw + formatear_fuentes(fuentes)
     except Exception as e:
         return f"Error conexión: {str(e)}"
 
@@ -211,10 +255,7 @@ def consultar_claude(texto, feedback=None, historial=None):
     }
     sistema = (
         f"Hoy es {fecha_hoy_es()}. Eres verificador editorial de BCN DESPERTA. "
-        "Usa la búsqueda web para contrastar. Prioriza fuentes: 1) Crónica Global, "
-        "2) Metrópoli Abierta, 3) El Español; si no está ahí, busca en otra prensa "
-        "fiable e indícalo. FORMATO: Línea 1 = titular; líneas siguientes = verificación "
-        "breve; última línea = 'Fuentes: [medios]'. No escribas etiquetas como 'TITULAR:'."
+        + INSTRUCCION_FUENTES
     )
     if feedback:
         contenido = (f"Análisis previo: {historial}. "
@@ -231,13 +272,24 @@ def consultar_claude(texto, feedback=None, historial=None):
     }
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=45)
-        if res.status_code == 200:
-            bloques = res.json().get("content", [])
-            texto_final = "".join(
-                b.get("text", "") for b in bloques if b.get("type") == "text"
-            )
-            return texto_final.strip() or "Sin respuesta de Claude."
-        return f"Error Claude {res.status_code}: {res.text[:300]}"
+        if res.status_code != 200:
+            return f"Error Claude {res.status_code}: {res.text[:300]}"
+        bloques = res.json().get("content", [])
+        texto_final = "".join(
+            b.get("text", "") for b in bloques if b.get("type") == "text"
+        ).strip()
+        # Fuentes reales: resultados de búsqueda + citas dentro del texto
+        fuentes = []
+        for b in bloques:
+            if b.get("type") == "web_search_tool_result":
+                for r in (b.get("content") or []):
+                    if isinstance(r, dict) and r.get("type") == "web_search_result":
+                        fuentes.append((r.get("title") or r.get("url"), r.get("url")))
+            if b.get("type") == "text":
+                for c in (b.get("citations") or []):
+                    if c.get("url"):
+                        fuentes.append((c.get("title") or c.get("url"), c.get("url")))
+        return (texto_final or "Sin respuesta de Claude.") + formatear_fuentes(fuentes)
     except Exception as e:
         return f"Error Claude: {str(e)}"
 
@@ -252,6 +304,7 @@ def push_resultado(texto_res, orig, motor, h=None):
 
 # --- 5. MOTOR AUDIO (HILO INDEPENDIENTE) ---
 def thread_voz(texto, item_id, model_id):
+    texto = limpiar_para_voz(texto)   # la voz no lee las fuentes ni las URLs
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"}
     data = {
