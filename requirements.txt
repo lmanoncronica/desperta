@@ -2,3 +2,7 @@ streamlit
 requests
 streamlit-autorefresh
 streamlit-mic-recorder
+sqlalchemy
+psycopg2-binary
+streamlit-webrtc
+av
