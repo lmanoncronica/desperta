@@ -45,6 +45,7 @@ API_KEY_CLAUDE     = get_secret("CLAUDE_API_KEY") or get_secret("ANTHROPIC_API_K
 ELEVEN_API_KEY     = get_secret("ELEVENLABS_API_KEY")
 API_KEY_PERPLEXITY = get_secret("PERPLEXITY_API_KEY")
 VOICE_ID           = get_secret("ELEVENLABS_VOICE_ID", "z0BZOmPMDRocOWMwLB5J")
+SUPABASE_DB_URL    = get_secret("SUPABASE_DB_URL")   # opcional: persistencia entre reinicios
 
 # Modelo de voz para directo. Flash v2.5 ≈ <75ms (ideal en vivo);
 # Multilingual v2 = más calidad pero más lento.
@@ -57,6 +58,18 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 # Modelo de Perplexity (opcional). sonar-pro = mejor veracidad.
 PERPLEXITY_MODEL = "sonar-pro"
 
+# --- APARIENCIA POR DEFECTO ---
+# Puedes cambiar estos valores aquí (quedan fijos) o en vivo desde el panel
+# "🎨 Apariencia" de la barra lateral (se aplican al instante en la pantalla).
+BRANDING_DEFAULT = {
+    "titulo": "BCN DESPERTA",
+    "color_fondo": "#000000",
+    "color_texto": "#FFFFFF",
+    "color_acento": "#FF0000",
+    "logo_url": "",          # pega aquí la URL de una imagen para mostrar el logo
+    "tam_titular": 80,       # tamaño del titular en la pantalla (px)
+}
+
 
 # --- 2. MEMORIA CENTRAL ---
 @st.cache_resource
@@ -68,6 +81,8 @@ class SharedState:
         self.archivo_historico = []
         self.sugerencias = []          # titulares propuestos por la IA al escuchar
         self.transcript_log = []       # historial de lo transcrito
+        self.branding = dict(BRANDING_DEFAULT)   # apariencia editable
+        self.cargado = False                     # ¿ya se cargó el estado guardado?
         self.lock = threading.Lock()   # para escribir desde el hilo de voz sin corromper datos
 
 gs = SharedState()
@@ -223,7 +238,7 @@ def extraer_sugerencias(transcript):
            f"{WORKING_MODEL}:generateContent?key={API_KEY_GEMINI}")
     prompt = (
         f"Hoy es {fecha_hoy_es()}. Eres asistente de redacción en un evento en directo. "
-        "A partir de esta transcripción de lo que se acaba de decir, detecta como máximo 3 "
+        "A partir de esta transcripción de lo que se acaba de decir, detecta como máximo 4 "
         "afirmaciones noticiables o verificables. "
         "Devuelve SOLO un array JSON, sin markdown ni texto extra, con este formato exacto: "
         '[{"titular": "...", "dato": "..."}]. '
@@ -237,7 +252,7 @@ def extraer_sugerencias(transcript):
         raw = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
         if isinstance(data, list):
-            return [d for d in data if isinstance(d, dict)][:3]
+            return [d for d in data if isinstance(d, dict)][:4]
     except Exception:
         pass
     return []
@@ -294,12 +309,131 @@ def consultar_claude(texto, feedback=None, historial=None):
         return f"Error Claude: {str(e)}"
 
 
-# --- HELPER: guardar un resultado en la cola de validación ---
-def push_resultado(texto_res, orig, motor, h=None):
-    gs.cola_resultados.insert(0, {
-        "res": texto_res, "h": h or time.strftime("%H:%M:%S"), "id": time.time(),
-        "audio": None, "status_voz": "IDLE", "orig": orig, "v": 0, "motor": motor,
-    })
+# --- ANÁLISIS EN SEGUNDO PLANO (no bloquea la interfaz) ---
+def _thread_analisis(item_id, texto, motor, feedback, historial):
+    """Ejecuta la verificación en un hilo y rellena la tarjeta al terminar."""
+    if motor == "claude":
+        res = consultar_claude(texto, feedback=feedback, historial=historial)
+    elif motor == "perplexity":
+        res = consultar_perplexity(texto)
+    else:
+        res = consultar_ia(texto, feedback=feedback, historial=historial)
+    with gs.lock:
+        for r in gs.cola_resultados:
+            if r["id"] == item_id:
+                r["res"] = res
+                r["estado"] = "LISTO"
+                if feedback is not None:
+                    r["v"] += 1
+                break
+
+
+def lanzar_analisis(orig, motor, h=None, feedback=None, historial=None, item_id=None):
+    """Crea (o reutiliza) una tarjeta y lanza el análisis en segundo plano."""
+    if item_id is None:
+        item_id = time.time()
+        gs.cola_resultados.insert(0, {
+            "res": "⏳ Analizando…", "h": h or time.strftime("%H:%M:%S"),
+            "id": item_id, "audio": None, "status_voz": "IDLE",
+            "orig": orig, "v": 0, "motor": motor, "estado": "ANALIZANDO",
+        })
+    else:
+        with gs.lock:
+            for r in gs.cola_resultados:
+                if r["id"] == item_id:
+                    r["estado"] = "ANALIZANDO"
+                    break
+    threading.Thread(target=_thread_analisis,
+                     args=(item_id, orig, motor, feedback, historial),
+                     daemon=True).start()
+    return item_id
+
+
+# --- COPIA DE SEGURIDAD: exportar / restaurar / persistir ---
+def exportar_estado():
+    """Serializa todo el estado a JSON (sin los bytes de audio)."""
+    with gs.lock:
+        data = {
+            "exportado": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "en_pantalla": gs.en_pantalla,
+            "pendientes": gs.cola_pendientes,
+            "resultados": [{k: v for k, v in r.items() if k != "audio"}
+                           for r in gs.cola_resultados],
+            "historico": gs.archivo_historico,
+            "sugerencias": gs.sugerencias,
+            "transcripciones": gs.transcript_log,
+            "branding": gs.branding,
+        }
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _aplicar_estado(data):
+    """Repuebla el estado a partir de un JSON (de la BD o de un archivo subido)."""
+    with gs.lock:
+        gs.en_pantalla = data.get("en_pantalla", gs.en_pantalla)
+        gs.cola_pendientes = data.get("pendientes", [])
+        resultados = data.get("resultados", [])
+        for r in resultados:
+            r.setdefault("v", 0)
+            r.setdefault("motor", "gemini")
+            if r.get("estado") == "ANALIZANDO":   # quedó a medias por un reinicio
+                r["res"] = "(Análisis interrumpido por un reinicio. Pulsa Reprocesar.)"
+            r["estado"] = "LISTO"
+            r["audio"] = None
+            r["status_voz"] = "IDLE"
+        gs.cola_resultados = resultados
+        gs.archivo_historico = data.get("historico", [])
+        gs.sugerencias = data.get("sugerencias", [])
+        gs.transcript_log = data.get("transcripciones", [])
+        gs.branding = {**BRANDING_DEFAULT, **data.get("branding", {})}
+
+
+@st.cache_resource
+def get_engine():
+    """Conexión a la base de datos (Supabase/Postgres). None si no está configurada."""
+    if not SUPABASE_DB_URL:
+        return None
+    try:
+        from sqlalchemy import create_engine, text
+        eng = create_engine(SUPABASE_DB_URL, pool_pre_ping=True)
+        with eng.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS estado_app (id TEXT PRIMARY KEY, data TEXT)"))
+        return eng
+    except Exception:
+        return None
+
+
+def guardar_estado():
+    """Guarda el estado en la base de datos (si está configurada)."""
+    eng = get_engine()
+    if not eng:
+        return
+    try:
+        from sqlalchemy import text
+        payload = exportar_estado()
+        with eng.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO estado_app (id, data) VALUES ('principal', :d) "
+                "ON CONFLICT (id) DO UPDATE SET data = :d"), {"d": payload})
+    except Exception:
+        pass
+
+
+def cargar_estado():
+    """Carga el estado desde la base de datos al arrancar (si la hay)."""
+    eng = get_engine()
+    if not eng:
+        return
+    try:
+        from sqlalchemy import text
+        with eng.connect() as conn:
+            row = conn.execute(
+                text("SELECT data FROM estado_app WHERE id='principal'")).fetchone()
+        if row and row[0]:
+            _aplicar_estado(json.loads(row[0]))
+    except Exception:
+        pass
 
 
 # --- 5. MOTOR AUDIO (HILO INDEPENDIENTE) ---
@@ -333,22 +467,12 @@ def thread_voz(texto, item_id, model_id):
 
 
 # --- 6. INTERFAZ ---
-st.set_page_config(page_title="BCN DESPERTA PRO", layout="wide")
+# Carga el estado guardado (de la BD) una sola vez al arrancar el contenedor
+if not gs.cargado:
+    cargar_estado()
+    gs.cargado = True
 
-st.markdown("""
-    <style>
-    .main { background-color: black !important; color: white !important; }
-    .stApp { background-color: black; }
-    .box-escena { background: black; padding: 60px; border-left: 25px solid #FF0000;
-                  height: 100vh; display: flex; flex-direction: column; justify-content: center; }
-    .tit-live { font-size: 80px; font-weight: bold; text-transform: uppercase;
-                line-height: 1.1; margin-bottom: 20px; }
-    .ver-live { font-size: 38px; color: #FF0000; font-style: italic;
-                border-top: 2px solid #333; padding-top: 20px; white-space: pre-wrap; }
-    .card-mem { background: #111; padding: 12px; border: 1px solid #333;
-                margin-bottom: 10px; border-radius: 5px; }
-    </style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title=gs.branding["titulo"], layout="wide")
 
 modo = st.sidebar.radio("MODO:", ["🛠️ CONTROL", "📺 ESCENARIO"])
 
@@ -367,26 +491,95 @@ MODELO_VOZ = VOZ_RAPIDA if voz_modo.startswith("Rápida") else VOZ_CALIDAD
 # Perplexity queda en el código pero apagado por defecto. Actívalo aquí si lo necesitas.
 mostrar_pplx = st.sidebar.checkbox("Mostrar Perplexity (opcional)", value=False)
 
+# --- 🎨 APARIENCIA EDITABLE (solo en CONTROL; se aplica antes de pintar el CSS) ---
+if modo == "🛠️ CONTROL":
+    with st.sidebar.expander("🎨 Apariencia (pantalla)"):
+        b = gs.branding
+        b["titulo"]       = st.text_input("Título / nombre", b["titulo"])
+        b["color_fondo"]  = st.color_picker("Fondo", b["color_fondo"])
+        b["color_texto"]  = st.color_picker("Texto", b["color_texto"])
+        b["color_acento"] = st.color_picker("Acento (borde y verificación)", b["color_acento"])
+        b["tam_titular"]  = st.slider("Tamaño del titular", 40, 130, b["tam_titular"])
+        b["logo_url"]     = st.text_input("Logo (URL de imagen)", b["logo_url"])
+        if st.button("↩️ Restaurar diseño original"):
+            gs.branding = dict(BRANDING_DEFAULT)
+            st.rerun()
+
+    # --- 🛟 COPIA DE SEGURIDAD Y RESTAURACIÓN ---
+    with st.sidebar.expander("🛟 Copia de seguridad"):
+        _eng = get_engine()
+        if _eng:
+            st.success("Base de datos conectada: se guarda solo.")
+        elif SUPABASE_DB_URL:
+            st.error("No se pudo conectar a la base de datos. Revisa SUPABASE_DB_URL.")
+        else:
+            st.info("Sin base de datos: usa la descarga/restauración manual.")
+        st.download_button(
+            "💾 Descargar copia (JSON)",
+            data=exportar_estado(),
+            file_name=f"bcndesperta_{time.strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        _subido = st.file_uploader("Restaurar desde copia (.json)", type=["json"],
+                                   key="restore_file")
+        if _subido is not None and st.button("♻️ Restaurar esta copia",
+                                             use_container_width=True):
+            try:
+                _aplicar_estado(json.loads(_subido.read().decode("utf-8")))
+                guardar_estado()
+                st.success("Copia restaurada correctamente.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo restaurar: {e}")
+
 st.sidebar.caption(f"Modelo IA: {WORKING_MODEL.split('/')[-1]}")
 
-if modo == "🛠️ CONTROL":
-    # Auto-refresco SOLO mientras hay audio generándose (para ver el cambio a LISTO)
-    if any(r.get("status_voz") == "GENERANDO" for r in gs.cola_resultados):
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=1500, key="audio_refresh")
+# CSS construido a partir de la apariencia elegida
+b = gs.branding
+_css = """
+    <style>
+    .main { background-color: __FONDO__ !important; color: __TEXTO__ !important; }
+    .stApp { background-color: __FONDO__; }
+    .box-escena { background: __FONDO__; padding: 60px; border-left: 25px solid __ACENTO__;
+                  height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+    .tit-live { font-size: __TAMTIT__px; font-weight: bold; text-transform: uppercase;
+                line-height: 1.1; margin-bottom: 20px; color: __TEXTO__; }
+    .ver-live { font-size: 38px; color: __ACENTO__; font-style: italic;
+                border-top: 2px solid #333; padding-top: 20px; white-space: pre-wrap; }
+    .card-mem { background: #111; padding: 12px; border: 1px solid #333;
+                margin-bottom: 10px; border-radius: 5px; }
+    .logo-escena { max-height: 130px; margin-bottom: 35px; }
+    </style>
+"""
+_css = (_css.replace("__FONDO__", b["color_fondo"])
+            .replace("__TEXTO__", b["color_texto"])
+            .replace("__ACENTO__", b["color_acento"])
+            .replace("__TAMTIT__", str(b["tam_titular"])))
+st.markdown(_css, unsafe_allow_html=True)
 
-    st.title("BCN DESPERTA - Control Editorial")
+if modo == "🛠️ CONTROL":
+    # Auto-refresco mientras haya algo en curso (análisis o voz), para ver cuándo acaban
+    ocupado = any(r.get("estado") == "ANALIZANDO" or r.get("status_voz") == "GENERANDO"
+                  for r in gs.cola_resultados)
+    if ocupado:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=1500, key="busy_refresh")
+
+    st.title(f"{gs.branding['titulo']} — Control Editorial")
 
     col_in, col_edit = st.columns([1, 1.3])
 
     with col_in:
-        # --- 🎤 ESCUCHA EN DIRECTO ---
-        st.subheader("🎤 Escucha en directo")
+        # --- 🎤 ESCUCHA ACTIVA ---
+        st.subheader("🎤 Escucha activa")
+        st.caption("Pulsa Escuchar, deja que hable el ponente y pulsa Pausar para que proponga "
+                   "titulares. Son sugerencias que se SUMAN a lo que metas a mano.")
         if STT_DISPONIBLE:
             stt_text = speech_to_text(
                 language="es",
-                start_prompt="🔴 Escuchar",
-                stop_prompt="⏹️ Parar y analizar",
+                start_prompt="▶️ Escuchar",
+                stop_prompt="⏸️ Pausar y proponer",
                 just_once=True,
                 use_container_width=True,
                 key="stt_live",
@@ -409,11 +602,7 @@ if modo == "🛠️ CONTROL":
                 )
                 cs1, cs2 = st.columns(2)
                 if cs1.button("🧠 Verificar", key=f"sug_v_{s['id']}"):
-                    with st.spinner("Gemini analizando..."):
-                        res = consultar_ia(
-                            f"{s.get('titular','')}. {s.get('dato','')}"
-                        )
-                    push_resultado(res, s.get("titular", ""), "gemini")
+                    lanzar_analisis(f"{s.get('titular','')}. {s.get('dato','')}", "gemini")
                     gs.sugerencias = [x for x in gs.sugerencias if x["id"] != s["id"]]
                     st.rerun()
                 if cs2.button("✖️ Descartar", key=f"sug_x_{s['id']}"):
@@ -442,23 +631,17 @@ if modo == "🛠️ CONTROL":
                         f"{item['texto'][:100]}...</div>", unsafe_allow_html=True)
             c_g, c_c = st.columns(2)
             if c_g.button("🧠 GEMINI", key=f"gem_{item['id']}"):
-                with st.spinner("Gemini analizando..."):
-                    res = consultar_ia(item["texto"])
-                push_resultado(res, item["texto"], "gemini", item["h"])
+                lanzar_analisis(item["texto"], "gemini", item["h"])
                 gs.cola_pendientes = [x for x in gs.cola_pendientes if x["id"] != item["id"]]
                 st.rerun()
             if c_c.button("🟣 CLAUDE", key=f"cla_{item['id']}"):
-                with st.spinner("Claude verificando en la web..."):
-                    res = consultar_claude(item["texto"])
-                push_resultado(res, item["texto"], "claude", item["h"])
+                lanzar_analisis(item["texto"], "claude", item["h"])
                 gs.cola_pendientes = [x for x in gs.cola_pendientes if x["id"] != item["id"]]
                 st.rerun()
             if mostrar_pplx:
                 if st.button("🔍 PERPLEXITY", key=f"pplx_{item['id']}",
                              use_container_width=True):
-                    with st.spinner("Perplexity buscando..."):
-                        res = consultar_perplexity(item["texto"])
-                    push_resultado(res, item["texto"], "perplexity", item["h"])
+                    lanzar_analisis(item["texto"], "perplexity", item["h"])
                     gs.cola_pendientes = [x for x in gs.cola_pendientes if x["id"] != item["id"]]
                     st.rerun()
 
@@ -469,26 +652,26 @@ if modo == "🛠️ CONTROL":
 
         for res_item in list(gs.cola_resultados):
             _motor = res_item.get("motor", "?").upper()
-            with st.expander(f"[{_motor}] Resultado - {res_item['h']}", expanded=True):
+            _analizando = res_item.get("estado") == "ANALIZANDO"
+            _cab = "⏳ Analizando…" if _analizando else "Resultado"
+            with st.expander(f"[{_motor}] {_cab} - {res_item['h']}", expanded=True):
+                if _analizando:
+                    st.info("Analizando en segundo plano. Puedes seguir trabajando en otros titulares.")
+                    if st.button("🗑️ Quitar", key=f"del_{res_item['id']}"):
+                        gs.cola_resultados = [x for x in gs.cola_resultados
+                                              if x["id"] != res_item["id"]]
+                        st.rerun()
+                    continue
+
                 txt_edit = st.text_area("Caja Editorial:", value=res_item["res"],
                                         key=f"txt_{res_item['id']}_v{res_item['v']}", height=180)
 
                 feedback = st.text_input("Corrección para reanalizar:",
                                          key=f"feed_{res_item['id']}")
                 if st.button("🔄 REPROCESAR E ITERAR", key=f"re_{res_item['id']}"):
-                    motor = res_item.get("motor", "gemini")
-                    with st.spinner("Re-evaluando..."):
-                        if motor == "claude":
-                            res_item["res"] = consultar_claude(res_item["orig"],
-                                                               feedback=feedback,
-                                                               historial=res_item["res"])
-                        elif motor == "perplexity":
-                            res_item["res"] = consultar_perplexity(res_item["orig"])
-                        else:
-                            res_item["res"] = consultar_ia(res_item["orig"],
-                                                           feedback=feedback,
-                                                           historial=res_item["res"])
-                        res_item["v"] += 1
+                    lanzar_analisis(res_item["orig"], res_item.get("motor", "gemini"),
+                                    feedback=feedback, historial=res_item["res"],
+                                    item_id=res_item["id"])
                     st.rerun()
 
                 st.write("---")
@@ -530,11 +713,17 @@ if modo == "🛠️ CONTROL":
         st.markdown(f"<small>[{h['h']}] {h['tipo']} | {h['t']}</small>",
                     unsafe_allow_html=True)
 
+    # Guarda automáticamente el estado (si hay base de datos configurada)
+    guardar_estado()
+
 else:  # --- MODO ESCENARIO ---
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=1000, key="stage_refresh")
+    _logo = gs.branding.get("logo_url", "")
+    _logo_html = f'<img src="{_logo}" class="logo-escena">' if _logo else ""
     st.markdown(f"""
         <div class="box-escena">
+            {_logo_html}
             <div class="tit-live">{gs.en_pantalla['t']}</div>
             <div class="ver-live">{gs.en_pantalla['v']}</div>
         </div>
