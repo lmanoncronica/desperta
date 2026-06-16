@@ -56,7 +56,6 @@ ELEVEN_API_KEY     = get_secret("ELEVENLABS_API_KEY")
 API_KEY_PERPLEXITY = get_secret("PERPLEXITY_API_KEY")
 VOICE_ID           = get_secret("ELEVENLABS_VOICE_ID", "z0BZOmPMDRocOWMwLB5J")
 SUPABASE_DB_URL    = get_secret("SUPABASE_DB_URL")   # opcional: persistencia entre reinicios
-DEEPGRAM_API_KEY   = get_secret("DEEPGRAM_API_KEY")  # opcional: escucha continua siempre activa
 
 # Modelo de voz para directo. Flash v2.5 ≈ <75ms (ideal en vivo);
 # Multilingual v2 = más calidad pero más lento.
@@ -279,7 +278,9 @@ def extraer_sugerencias(transcript):
     return []
 
 
-# --- ESCUCHA CONTINUA: audio PCM -> WAV -> transcripción con Deepgram ---
+# --- ESCUCHA CONTINUA: audio PCM -> WAV -> transcripción con ElevenLabs Scribe ---
+SCRIBE_MODEL = "scribe_v2"   # modelo de voz-a-texto de ElevenLabs
+
 def _pcm_a_wav(pcm, rate=16000):
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -290,18 +291,19 @@ def _pcm_a_wav(pcm, rate=16000):
     return buf.getvalue()
 
 
-def transcribir_deepgram(wav_bytes):
-    if not DEEPGRAM_API_KEY:
+def transcribir_elevenlabs(wav_bytes):
+    """Transcribe un bloque de audio con ElevenLabs Scribe (misma clave que la voz)."""
+    if not ELEVEN_API_KEY:
         return ""
     try:
         r = requests.post(
-            "https://api.deepgram.com/v1/listen?language=es&model=nova-2&smart_format=true",
-            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}",
-                     "Content-Type": "audio/wav"},
-            data=wav_bytes, timeout=20)
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": ELEVEN_API_KEY},
+            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            data={"model_id": SCRIBE_MODEL},
+            timeout=25)
         if r.status_code == 200:
-            alt = r.json()["results"]["channels"][0]["alternatives"][0]
-            return (alt.get("transcript") or "").strip()
+            return (r.json().get("text") or "").strip()
     except Exception:
         pass
     return ""
@@ -792,20 +794,24 @@ if modo == "🛠️ CONTROL":
     guardar_estado()
 
 elif modo == "👂 ESCUCHA":
-    st.title("👂 Escucha continua")
-    st.caption("Pulsa START y deja el micrófono abierto: transcribe en continuo y propone "
-               "titulares automáticamente. Las sugerencias aparecen en el modo CONTROL. "
-               "Mantén esta pestaña abierta en un equipo cerca del audio del acto.")
+    st.title("👂 Escucha")
+    st.caption("Pulsa START para activar el micrófono. Las sugerencias aparecen en el modo "
+               "CONTROL. Mantén esta pestaña abierta en un equipo cerca del audio del acto.")
 
     if not WEBRTC_DISPONIBLE:
         st.error("Falta instalar streamlit-webrtc y av. Sube el requirements.txt nuevo "
                  "y deja que Streamlit reinstale.")
-    elif not DEEPGRAM_API_KEY:
-        st.warning("Falta DEEPGRAM_API_KEY en los Secrets. Crea una cuenta en deepgram.com "
-                   "(tiene crédito gratis), copia la clave y pégala en los Secrets.")
+    elif not ELEVEN_API_KEY:
+        st.warning("Falta ELEVENLABS_API_KEY en los Secrets (es la misma clave de la voz).")
     else:
+        modo_escucha = st.radio(
+            "Modo:",
+            ["🎙️ Por ráfagas (ahorra saldo)", "🔴 Continua"],
+            help="Por ráfagas: solo transcribe (y gasta) cuando pulsas Capturar. "
+                 "Continua: transcribe todo el rato mientras esté abierto.")
+
         webrtc_ctx = webrtc_streamer(
-            key="escucha-continua",
+            key="escucha-webrtc",
             mode=WebRtcMode.SENDONLY,
             audio_receiver_size=1024,
             media_stream_constraints={"audio": True, "video": False},
@@ -814,13 +820,57 @@ elif modo == "👂 ESCUCHA":
         estado = st.empty()
         trans_box = st.empty()
 
-        if "buf_audio" not in st.session_state:
-            st.session_state.buf_audio = b""
-            st.session_state.t_ultimo = time.time()
-            st.session_state.trans_acum = ""
+        def _procesar_pcm(pcm):
+            """Transcribe un bloque de audio y vuelca sugerencias a CONTROL."""
+            if not pcm:
+                return ""
+            txt = transcribir_elevenlabs(_pcm_a_wav(pcm, 16000))
+            if txt:
+                gs.transcript_log.insert(0, {"h": time.strftime("%H:%M:%S"), "txt": txt})
+                for k, s in enumerate(extraer_sugerencias(txt)):
+                    s["id"] = time.time() + k
+                    gs.sugerencias.insert(0, s)
+                guardar_estado()
+            return txt
 
-        if webrtc_ctx.state.playing:
-            estado.success("🔴 Escuchando… (deja esta pestaña abierta)")
+        if not webrtc_ctx.state.playing:
+            estado.info("Pulsa START para empezar. Acepta el micrófono en el navegador (Chrome).")
+
+        # ---------- MODO POR RÁFAGAS ----------
+        elif modo_escucha.startswith("🎙️"):
+            estado.success("🟢 Micrófono activo. Captura cuando quieras (solo gastas en cada ráfaga).")
+            dur = st.slider("Segundos por ráfaga", 5, 30, 15)
+            if st.button("🎙️ Capturar ráfaga", use_container_width=True, type="primary"):
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+                pcm = b""
+                with st.spinner(f"Grabando {dur}s y transcribiendo…"):
+                    # descarta el audio viejo para capturar "desde ahora"
+                    try:
+                        webrtc_ctx.audio_receiver.get_frames(timeout=0.2)
+                    except Exception:
+                        pass
+                    t0 = time.time()
+                    while time.time() - t0 < dur:
+                        try:
+                            frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
+                        except Exception:
+                            break
+                        for f in frames:
+                            for rf in resampler.resample(f):
+                                pcm += bytes(rf.planes[0])
+                    txt = _procesar_pcm(pcm)
+                if txt:
+                    st.success("Ráfaga procesada. Sugerencias enviadas a CONTROL.")
+                    trans_box.markdown(f"**Última transcripción:** {txt}")
+                else:
+                    st.warning("No se captó audio claro. Acerca el micro y reintenta.")
+
+        # ---------- MODO CONTINUA ----------
+        else:
+            estado.success("🔴 Escuchando en continuo… (consume saldo mientras esté abierto)")
+            if "buf_audio" not in st.session_state:
+                st.session_state.buf_audio = b""
+                st.session_state.t_ultimo = time.time()
             resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
             while True:
                 try:
@@ -830,25 +880,13 @@ elif modo == "👂 ESCUCHA":
                 for f in frames:
                     for rf in resampler.resample(f):
                         st.session_state.buf_audio += bytes(rf.planes[0])
-                # cada ~5 s, transcribe el bloque acumulado y propone titulares
                 if time.time() - st.session_state.t_ultimo > 5 and st.session_state.buf_audio:
-                    wav = _pcm_a_wav(st.session_state.buf_audio, 16000)
+                    pcm = st.session_state.buf_audio
                     st.session_state.buf_audio = b""
                     st.session_state.t_ultimo = time.time()
-                    txt = transcribir_deepgram(wav)
+                    txt = _procesar_pcm(pcm)
                     if txt:
-                        st.session_state.trans_acum = (
-                            st.session_state.trans_acum + " " + txt)[-1200:]
-                        gs.transcript_log.insert(
-                            0, {"h": time.strftime("%H:%M:%S"), "txt": txt})
-                        trans_box.markdown(
-                            f"**Transcripción reciente:** {st.session_state.trans_acum[-500:]}")
-                        for k, s in enumerate(extraer_sugerencias(txt)):
-                            s["id"] = time.time() + k
-                            gs.sugerencias.insert(0, s)
-                        guardar_estado()
-        else:
-            estado.info("Pulsa START para empezar a escuchar. Las propuestas irán al modo CONTROL.")
+                        trans_box.markdown(f"**Transcripción reciente:** {txt}")
 
 else:  # --- MODO ESCENARIO ---
     from streamlit_autorefresh import st_autorefresh
