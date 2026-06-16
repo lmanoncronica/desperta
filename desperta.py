@@ -602,11 +602,18 @@ st.sidebar.caption(f"Modelo IA: {WORKING_MODEL.split('/')[-1]}")
 # CSS: el panel de control queda oscuro y legible; la PANTALLA usa toda la apariencia
 b = gs.branding
 _align_items = "center" if b["alineacion"] == "center" else "flex-start"
+_es_escenario = (modo == "📺 ESCENARIO")
+# En ESCENARIO el fondo elegido cubre TODA la pantalla; en CONTROL/ESCUCHA, oscuro
+_app_bg = b["color_fondo"] if _es_escenario else "#000000"
+_app_text = b["color_titular"] if _es_escenario else "#FFFFFF"
+_extra = (".block-container { padding: 0 !important; max-width: 100% !important; }"
+          if _es_escenario else "")
 _css = """
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;700&family=Montserrat:wght@600;800&display=swap');
-    .main { background-color: #000 !important; color: #FFF !important; }
-    .stApp { background-color: #000; }
+    .main { background-color: __APPBG__ !important; color: __APPTEXT__ !important; }
+    .stApp { background-color: __APPBG__; }
+    __EXTRA__
     .box-escena { background: __FONDO__; padding: 60px; border-left: __BORDE__px solid __ACENTO__;
                   height: 100vh; display: flex; flex-direction: column; justify-content: center;
                   align-items: __ALIGNITEMS__; text-align: __ALIGN__; }
@@ -621,7 +628,10 @@ _css = """
     .logo-escena { max-height: __TAMLOGO__px; margin-bottom: 35px; }
     </style>
 """
-_css = (_css.replace("__FONDO__", b["color_fondo"])
+_css = (_css.replace("__APPBG__", _app_bg)
+            .replace("__APPTEXT__", _app_text)
+            .replace("__EXTRA__", _extra)
+            .replace("__FONDO__", b["color_fondo"])
             .replace("__ACENTO__", b["color_acento"])
             .replace("__BORDE__", str(b["grosor_borde"]))
             .replace("__ALIGNITEMS__", _align_items)
@@ -893,7 +903,7 @@ else:  # --- MODO ESCENARIO ---
     st_autorefresh(interval=1000, key="stage_refresh")
     _logo = gs.branding.get("logo_url", "")
     _logo_html = f'<img src="{_logo}" class="logo-escena">' if _logo else ""
-    _t = gs.en_pantalla.get("t") or "&nbsp;"
+    _t = gs.en_pantalla.get("t") or gs.branding.get("titulo") or "&nbsp;"
     _v = gs.en_pantalla.get("v") or "&nbsp;"
     _html = (
         '<div class="box-escena">'
