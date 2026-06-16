@@ -893,10 +893,13 @@ else:  # --- MODO ESCENARIO ---
     st_autorefresh(interval=1000, key="stage_refresh")
     _logo = gs.branding.get("logo_url", "")
     _logo_html = f'<img src="{_logo}" class="logo-escena">' if _logo else ""
-    st.markdown(f"""
-        <div class="box-escena">
-            {_logo_html}
-            <div class="tit-live">{gs.en_pantalla['t']}</div>
-            <div class="ver-live">{gs.en_pantalla['v']}</div>
-        </div>
-    """, unsafe_allow_html=True)
+    _t = gs.en_pantalla.get("t") or "&nbsp;"
+    _v = gs.en_pantalla.get("v") or "&nbsp;"
+    _html = (
+        '<div class="box-escena">'
+        + _logo_html
+        + f'<div class="tit-live">{_t}</div>'
+        + f'<div class="ver-live">{_v}</div>'
+        + '</div>'
+    )
+    st.markdown(_html, unsafe_allow_html=True)
